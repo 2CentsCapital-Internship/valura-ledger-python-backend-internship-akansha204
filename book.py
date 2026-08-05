@@ -31,6 +31,11 @@ def money(x: Decimal) -> Decimal:
     return x.quantize(D("0.01"), rounding=ROUND_HALF_UP)
 
 
+def qstr(x: Decimal) -> str:
+    """Plain decimal string for a quantity, trailing zeros stripped."""
+    return format(D(x).normalize(), "f")
+
+
 def leg(account: str, customer_id: str, debit=ZERO, credit=ZERO) -> dict:
     return {"account": account, "customer_id": customer_id,
             "debit": str(money(D(debit))), "credit": str(money(D(credit)))}
@@ -45,6 +50,78 @@ class Book:
         # the run: the client keeps consuming and tells you the list at the end.
         self.todo: dict[str, int] = defaultdict(int)
 
+        # Every account ever posted to, even those netted back to zero.
+        self.touched: set[str] = set()
+
+        # FIFO lot book per (customer, symbol). Delivery order = list order.
+        # Each lot: {"id": int, "qty": Decimal, "cost": Decimal (total cost)}
+        self.lots: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        self._next_lot_id = 0
+
+        # Order lifecycle (filled in by later phases).
+        self.orders: dict[str, dict] = {}          # order_id -> order data
+        self.holds: dict[str, dict] = {}           # order_id -> {side, total, remaining}
+        self.open_routes: dict[str, str] = {}      # order_id -> broker (still open)
+        self.refs: dict[str, dict] = {}            # withdrawal_id -> data
+
+        # Full history in delivery order. Each entry:
+        #   {"event": ev, "legs": [...], "lot_ops": [...], "status": ...}
+        # Powers as-of checkpoints (replay) and reversals (lookup + inverse).
+        self.event_log: list[dict] = []
+        self._ops: list[dict] = []                 # lot ops of the event being applied
+
+    # -----------------------------------------------------------------------
+    # Lot book helpers. Every mutation is recorded into self._ops so a reversal
+    # can undo it exactly, and so as-of replay is reproducible.
+    # -----------------------------------------------------------------------
+    def _add_lot(self, cid: str, symbol: str, q: Decimal, cost: Decimal) -> int:
+        lot = {"id": self._next_lot_id, "qty": q, "cost": cost}
+        self._next_lot_id += 1
+        self.lots[(cid, symbol)].append(lot)
+        self._ops.append({"op": "add", "cid": cid, "symbol": symbol,
+                          "id": lot["id"], "qty": q, "cost": cost})
+        return lot["id"]
+
+    def _consume_lots(self, cid: str, symbol: str, q: Decimal) -> Decimal:
+        """FIFO cost relief. Raises Rejected on oversell BEFORE touching lots.
+
+        Cost relieved is round(lot_total x sold_qty / lot_qty); the remainder
+        stays with the lot. No lots are half-consumed on a rejected sell.
+        """
+        lots = self.lots.get((cid, symbol), [])
+        if q > sum(l["qty"] for l in lots):
+            raise Rejected("oversell")
+        remaining = q
+        total_cost = ZERO
+        while remaining > 0:
+            lot = lots[0]
+            take = min(lot["qty"], remaining)
+            if take == lot["qty"]:
+                cost = lot["cost"]
+                lots.pop(0)
+                self._ops.append({"op": "remove", "cid": cid, "symbol": symbol,
+                                  "id": lot["id"], "qty": take, "cost": cost})
+            else:
+                cost = money(lot["cost"] * take / lot["qty"])
+                lot["qty"] -= take
+                lot["cost"] -= cost
+                self._ops.append({"op": "relieve", "cid": cid, "symbol": symbol,
+                                  "id": lot["id"], "qty": take, "cost": cost})
+            total_cost += cost
+            remaining -= take
+        return total_cost
+
+    def _position(self, cid: str, symbol: str) -> tuple[Decimal, Decimal]:
+        lots = self.lots.get((cid, symbol), [])
+        return sum(l["qty"] for l in lots), sum(l["cost"] for l in lots)
+
+    def find_event(self, event_id: str) -> dict | None:
+        """The raw event as first delivered, or None."""
+        for entry in self.event_log:
+            if entry["event"]["event_id"] == event_id:
+                return entry["event"]
+        return None
+
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
         """Post one event and return its legs.
@@ -55,26 +132,34 @@ class Book:
         """
         eid = ev["event_id"]
         if eid in self.seen:
-            return []                      # already posted; nothing new happens
+            return []                      # already seen; nothing new happens
         self.seen.add(eid)
 
+        entry = {"event": ev, "legs": [], "lot_ops": [], "status": "noop"}
+        self._ops = []
         handler = getattr(self, "on_" + ev["type"], None)
-        if handler is None:
+        if handler is not None:
+            try:
+                legs = handler(ev["payload"], ev) or []
+                if legs:
+                    self._post(legs)
+                    entry["legs"] = legs
+                    entry["status"] = "posted"
+            except NotImplementedError:
+                # Not written yet. Submit nothing for it and carry on.
+                self.todo[ev["type"]] += 1
+                entry["status"] = "unimplemented"
+            except Rejected:
+                # An event you refuse still gets a submission, with no legs, and
+                # it must leave your book exactly as it was. A redelivered
+                # rejected event stays one rejection: it is already in `seen`.
+                entry["status"] = "rejected"
+        else:
             self.todo[ev["type"]] += 1
-            return []
-        try:
-            legs = handler(ev["payload"], ev) or []
-        except NotImplementedError:
-            # Not written yet. Submit nothing for it and carry on, so one
-            # missing handler costs you that event rather than the whole run.
-            self.todo[ev["type"]] += 1
-            return []
-        except Rejected:
-            # An event you refuse still gets a submission, with no legs, and it
-            # must leave your book exactly as it was.
-            return []
-        self._post(legs)
-        return legs
+            entry["status"] = "unimplemented"
+        entry["lot_ops"] = self._ops
+        self.event_log.append(entry)
+        return entry["legs"]
 
     def _post(self, legs: list[dict]) -> None:
         dr = sum(D(l["debit"]) for l in legs)
@@ -82,8 +167,28 @@ class Book:
         if money(dr) != money(cr):
             raise AssertionError(f"unbalanced: dr {dr} cr {cr}")
         for l in legs:
+            self.touched.add(l["account"])
             self.balances[(l["customer_id"], l["account"])] += (
                 D(l["debit"]) - D(l["credit"]))
+
+    # -----------------------------------------------------------------------
+    # As-of answering: replay the event log into a fresh book and snapshot it.
+    # At 800-6,000 events this is comfortably under a second, well inside the
+    # checkpoint grace period.
+    # -----------------------------------------------------------------------
+    def _replay_to(self, target_event_id: str) -> "Book":
+        book = Book()
+        found = False
+        for entry in self.event_log:
+            book.apply(entry["event"])
+            if entry["event"]["event_id"] == target_event_id:
+                found = True
+                break
+        if not found:
+            print(f"  as-of target {target_event_id} not in log; using current state",
+                  flush=True)
+            return self
+        return book
 
     # -- worked example -----------------------------------------------------
     def on_deposit(self, p: dict, ev: dict) -> list[dict]:
@@ -117,7 +222,8 @@ class Book:
     def on_fx_deposit(self, p, ev):
         raise NotImplementedError(
             "Dr 1100 usd_at_market_rate / Cr 2010 usd_at_customer_rate / "
-            "Cr 4100 the difference")
+            "Cr 4100 the difference. A customer rate better than the market "
+            "rate is bad data: reject it")
 
     def on_withdrawal_requested(self, p, ev):
         raise NotImplementedError("Dr 2010 amount / Cr 2300 amount")
@@ -178,30 +284,58 @@ class Book:
             "balances perfectly and corrupts every later cost basis")
 
     # -- reporting ----------------------------------------------------------
-    def snapshot(self) -> dict:
+    def snapshot(self, as_of_event_id: str | None = None) -> dict:
         """What a checkpoint_request wants: your whole state, right now.
+
+        With as_of_event_id, the state as it stood once you had processed that
+        event in delivery order, and nothing after it (backdated events that
+        arrived later are excluded).
 
         Report every account you have ever posted to, including any that have
         netted back to zero. Trial balance values are debit-positive, so
         liabilities carry a negative sign.
         """
+        book = self._replay_to(as_of_event_id) if as_of_event_id else self
+
         tb: dict[str, Decimal] = defaultdict(lambda: ZERO)
-        for (_cid, acct), bal in self.balances.items():
+        for (_cid, acct), bal in book.balances.items():
             tb[acct] += bal
+        for acct in book.touched:
+            tb.setdefault(acct, ZERO)
 
         customers: dict[str, dict] = {}
-        for (cid, acct), bal in self.balances.items():
+        for (cid, acct), bal in book.balances.items():
             c = customers.setdefault(cid, {"wallet_cash": ZERO,
                                            "cash_hold": ZERO, "positions": {}})
             if acct == "2010":
                 c["wallet_cash"] += -bal          # a liability, so credit-positive
 
+        for oid, hold in book.holds.items():
+            if hold["side"] == "buy" and hold["remaining"] > 0:
+                cid = book.orders[oid]["customer_id"]
+                c = customers.setdefault(cid, {"wallet_cash": ZERO,
+                                               "cash_hold": ZERO,
+                                               "positions": {}})
+                c["cash_hold"] += hold["remaining"]
+
+        for (cid, symbol), lots in book.lots.items():
+            total_qty = sum(l["qty"] for l in lots)
+            if total_qty > 0:
+                c = customers.setdefault(cid, {"wallet_cash": ZERO,
+                                               "cash_hold": ZERO,
+                                               "positions": {}})
+                c["positions"][symbol] = {
+                    "quantity": qstr(total_qty),
+                    "cost_basis": str(money(sum(l["cost"] for l in lots))),
+                }
+
         return {
             "trial_balance": {a: str(money(v)) for a, v in sorted(tb.items())},
             "customers": {cid: {"wallet_cash": str(money(c["wallet_cash"])),
                                 "cash_hold": str(money(c["cash_hold"])),
-                                "positions": c["positions"]}
+                                "positions": dict(sorted(c["positions"].items()))}
                           for cid, c in sorted(customers.items())},
+            "open_order_routes": dict(sorted(book.open_routes.items())),
         }
 
 
