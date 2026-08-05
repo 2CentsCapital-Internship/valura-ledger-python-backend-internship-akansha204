@@ -36,6 +36,11 @@ def qstr(x: Decimal) -> str:
     return format(D(x).normalize(), "f")
 
 
+def qty6(x: Decimal) -> Decimal:
+    """Share quantity to at most 6 decimal places, half away from zero."""
+    return D(x).quantize(D("0.000001"), rounding=ROUND_HALF_UP)
+
+
 def leg(account: str, customer_id: str, debit=ZERO, credit=ZERO) -> dict:
     return {"account": account, "customer_id": customer_id,
             "debit": str(money(D(debit))), "credit": str(money(D(credit)))}
@@ -578,20 +583,54 @@ class Book:
             self.holds[oid]["remaining"] = ZERO
 
     def on_dividend_cash(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 net / Cr 2010 net. Tax is withheld at source, so raise no "
-            "payable")
+        """A dividend arrives. Tax was withheld at source, so only the net ever
+        reaches the firm and the firm owes the tax to nobody.
+
+            Dr 1100 net           Cr 2010 net
+        """
+        net = money(D(p["net_amount"]))
+        cid = p["customer_id"]
+        return [leg("1100", cid, debit=net),
+                leg("2010", cid, credit=net)]
 
     def on_dividend_reinvested(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1200 net / Cr 2100 net, and add a lot. Cash is not involved")
+        """The broker reinvests the net directly. Cash is never involved: the
+        customer's holding grows by a new lot of reinvest_quantity whose cost
+        is the net amount.
+
+            Dr 1200 net           Cr 2100 net       and add a lot
+        """
+        net = money(D(p["net_amount"]))
+        cid = p["customer_id"]
+        q = D(p["reinvest_quantity"])
+        self._add_lot(cid, p["symbol"], q, net)
+        return [leg("1200", cid, debit=net),
+                leg("2100", cid, credit=net)]
 
     def on_stock_split(self, p, ev):
-        raise NotImplementedError(
-            "No legs. Quantity scales; total cost does not change")
+        """No legs. Quantity scales by ratio_to / ratio_from; the total cost of
+        each lot is unchanged, so cost per share moves.
+        """
+        cid = p["customer_id"]
+        symbol = p["symbol"]
+        factor = D(p["ratio_to"]) / D(p["ratio_from"])
+        for lot in self.lots.get((cid, symbol), []):
+            lot["qty"] = qty6(lot["qty"] * factor)
+        return []
 
     def on_symbol_change(self, p, ev):
-        raise NotImplementedError("No legs. Re-key the holding")
+        """No legs. Re-key the holding from the old symbol to the new one."""
+        cid = p["customer_id"]
+        old_key = (cid, p["old_symbol"])
+        if old_key not in self.lots:
+            return []
+        lots = self.lots.pop(old_key)
+        new_key = (cid, p["new_symbol"])
+        if new_key in self.lots:
+            self.lots[new_key].extend(lots)
+        else:
+            self.lots[new_key] = lots
+        return []
 
     def on_reversal(self, p, ev):
         raise NotImplementedError(
