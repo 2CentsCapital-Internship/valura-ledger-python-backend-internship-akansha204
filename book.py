@@ -41,6 +41,41 @@ def leg(account: str, customer_id: str, debit=ZERO, credit=ZERO) -> dict:
             "debit": str(money(D(debit))), "credit": str(money(D(credit)))}
 
 
+# -- tariff ---------------------------------------------------------------
+# All per unit of principal. bps = basis points (1 bps = 0.0001).
+TARIFF: dict[str, dict] = {
+    "BRK-A": {"classes": ("equity", "etf"),  "brokerage_bps": D("0.0020"),
+              "custody_bps": D("0.0004"), "broker_cost_bps": D("0.0009"),
+              "custody_cost_bps": D("0.0002"), "min_fee": D("1.00"),
+              "ticket": D("0.35")},
+    "BRK-B": {"classes": ("equity", "bond"), "brokerage_bps": D("0.0015"),
+              "custody_bps": D("0.0005"), "broker_cost_bps": D("0.0008"),
+              "custody_cost_bps": D("0.0003"), "min_fee": D("2.50"),
+              "ticket": D("3.00")},
+    "BRK-C": {"classes": ("etf", "bond"),   "brokerage_bps": D("0.0025"),
+              "custody_bps": D("0.0003"), "broker_cost_bps": D("0.0012"),
+              "custody_cost_bps": D("0.0001"), "min_fee": D("0.50"),
+              "ticket": D("0.20")},
+}
+REG_BPS = D("0.0008")
+
+
+def broker_fees(broker: str, principal: Decimal) -> tuple[Decimal, ...]:
+    """Derive the fill fee chain for one broker and principal. Each amount is
+    rounded to the cent independently, before use. Broker cost includes the
+    broker's flat ticket fee whatever the size of the fill.
+
+    Returns (brokerage, custody, regulatory, broker_cost, custody_cost).
+    """
+    t = TARIFF[broker]
+    brokerage = max(money(principal * t["brokerage_bps"]), t["min_fee"])
+    custody = money(principal * t["custody_bps"])
+    reg = money(principal * REG_BPS)
+    broker_cost = money(principal * t["broker_cost_bps"]) + t["ticket"]
+    custody_cost = money(principal * t["custody_cost_bps"])
+    return brokerage, custody, reg, broker_cost, custody_cost
+
+
 class Book:
     def __init__(self) -> None:
         # balances[(customer_id, account)] = debit-positive balance
@@ -60,8 +95,9 @@ class Book:
 
         # Order lifecycle (filled in by later phases).
         self.orders: dict[str, dict] = {}          # order_id -> order data
-        self.holds: dict[str, dict] = {}           # order_id -> {side, total, remaining}
+        self.holds: dict[str, dict] = {}           # order_id -> {side, total, remaining, order_qty}
         self.open_routes: dict[str, str] = {}      # order_id -> broker (still open)
+        self.closed_orders: set[str] = set()       # fully filled, cancelled, or rejected
 
         # Lookups for events that reference earlier ones.
         self.withdrawals: dict[str, dict] = {}     # withdrawal_id -> {amount, customer_id}
@@ -314,9 +350,48 @@ class Book:
                 leg("2010", cid, credit=w["amount"])]
 
     def on_order_placed(self, p, ev):
-        raise NotImplementedError(
-            "No legs. A placement moves no money: it creates a hold, which is "
-            "reported at checkpoints and never posted")
+        """No legs. A placement moves no money: it creates a hold, which is
+        reported at checkpoints and never posted. It also records the routing
+        decision for the still-open order.
+
+        A fill may arrive before its placement (the stream is not date-ordered);
+        the order record and hold then account for the quantity already filled.
+        """
+        oid = p["order_id"]
+        order = self.orders.get(oid) or {}
+        order.update({
+            "customer_id": p["customer_id"],
+            "side": p["side"],
+            "symbol": p["symbol"],
+            "quantity": D(p["quantity"]),
+            "limit_price": money(D(p["limit_price"])),
+            "asset_class": p["asset_class"],
+            "est_charges": money(D(p["est_charges"])),
+            "filled_qty": order.get("filled_qty", ZERO),
+        })
+        self.orders[oid] = order
+
+        if oid in self.closed_orders:
+            return []                      # already filled or cancelled; nothing to hold
+
+        side = order["side"]
+        q = order["quantity"]
+        unfilled = q - order["filled_qty"]
+        if unfilled <= 0:
+            self._close_order(oid)
+            return []
+
+        if side == "buy":
+            total = money(q * order["limit_price"]) + order["est_charges"]
+            remaining = money(total * unfilled / q)
+        else:
+            total = q
+            remaining = unfilled
+        self.holds[oid] = {"side": side, "total": total,
+                           "remaining": remaining, "order_qty": q}
+        principal = money(q * order["limit_price"])
+        self.open_routes[oid] = self._route(order["asset_class"], principal)
+        return []
 
     def on_order_partially_filled(self, p, ev):
         return self.on_order_filled(p, ev)
@@ -334,10 +409,54 @@ class Book:
             "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
 
     def on_order_cancelled(self, p, ev):
-        raise NotImplementedError("No legs. Release the remaining hold")
+        """No legs. Release the remaining hold; the order is closed."""
+        self._close_order(p["order_id"])
+        return []
 
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
+
+    # -- order lifecycle helpers -------------------------------------------
+    def _route(self, asset_class: str, principal: Decimal) -> str:
+        """Cheapest total customer charge (brokerage + custody) at this
+        principal, among brokers trading the asset class. Ties break on broker
+        id ascending, so there is always exactly one right answer.
+        """
+        best, best_cost = None, None
+        for broker in sorted(TARIFF):
+            t = TARIFF[broker]
+            if asset_class not in t["classes"]:
+                continue
+            brokerage = max(money(principal * t["brokerage_bps"]), t["min_fee"])
+            custody = money(principal * t["custody_bps"])
+            cost = brokerage + custody
+            if best_cost is None or cost < best_cost:
+                best, best_cost = broker, cost
+        return best
+
+    def _release_hold(self, oid: str, fill_qty: Decimal) -> None:
+        """A fill releases a proportional share of the hold that order placed.
+        The final fill or a cancellation releases whatever remains, so a closed
+        order always returns its hold to exactly zero (see _close_order).
+        """
+        hold = self.holds.get(oid)
+        if hold is None or hold["order_qty"] == 0:
+            return
+        if hold["side"] == "buy":
+            release = money(hold["total"] * fill_qty / hold["order_qty"])
+        else:
+            release = fill_qty
+        hold["remaining"] = max(hold["remaining"] - release, ZERO)
+
+    def _close_order(self, oid: str) -> None:
+        """Final fill, cancellation, or rejection: release the rest of the hold
+        and drop the open-order route. A released hold stays released even if a
+        fill is later reversed.
+        """
+        self.closed_orders.add(oid)
+        self.open_routes.pop(oid, None)
+        if oid in self.holds:
+            self.holds[oid]["remaining"] = ZERO
 
     def on_dividend_cash(self, p, ev):
         raise NotImplementedError(
