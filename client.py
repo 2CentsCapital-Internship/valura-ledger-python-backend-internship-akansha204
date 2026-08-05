@@ -38,6 +38,8 @@ class ArenaClient:
         self.cursor = 0
         self.stats = {"events": 0, "posted": 0, "checkpoints": 0,
                       "reconnects": 0, "resets": 0, "errors": 0}
+        self.feedback = []
+        self.feedback_path = None
         self.done = False
 
     # -- submitting ---------------------------------------------------------
@@ -56,6 +58,8 @@ class ArenaClient:
                 return
             r.raise_for_status()
             self.stats["posted"] += len(body["postings"])
+            if self.mode == "practice" and self.feedback_path:
+                self.feedback.append(r.json())
         except httpx.HTTPError:
             self.stats["errors"] += 1
             self.pending = body["postings"] + self.pending
@@ -74,10 +78,12 @@ class ArenaClient:
             as_of_event_id=payload.get("as_of_event_id"))
         self.flush(http)
         try:
-            http.post(f"{self.url}/v1/checkpoint", params={"mode": self.mode},
-                      json={"checkpoint_id": payload["checkpoint_id"], **snap},
-                      timeout=30)
+            r = http.post(f"{self.url}/v1/checkpoint", params={"mode": self.mode},
+                          json={"checkpoint_id": payload["checkpoint_id"], **snap},
+                          timeout=30)
             self.stats["checkpoints"] += 1
+            if self.mode == "practice" and self.feedback_path:
+                self.feedback.append(r.json())
         except httpx.HTTPError:
             self.stats["errors"] += 1
 
@@ -168,6 +174,8 @@ def main() -> int:
     ap.add_argument("--mode", default="practice",
                     choices=["practice", "submission", "final"])
     ap.add_argument("--seconds", type=float, default=1500)
+    ap.add_argument("--feedback", default=None,
+                    help="write practice response feedback (diffs) to PATH")
     a = ap.parse_args()
 
     if a.mode != "practice":
@@ -178,8 +186,14 @@ def main() -> int:
             return 1
 
     c = ArenaClient(a.url, a.key, a.mode)
+    c.feedback_path = a.feedback
     print(f"connecting to {a.url} as {a.mode} ...", flush=True)
     out = c.run(a.seconds)
+    if c.feedback and a.feedback:
+        with open(a.feedback, "w") as f:
+            for fb in c.feedback:
+                f.write(json.dumps(fb) + "\n")
+        print(f"wrote {len(c.feedback)} responses to {a.feedback}")
     print("\nstats:", json.dumps(out["stats"]))
     todo = getattr(c.book, "todo", {})
     if todo:
