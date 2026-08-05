@@ -106,6 +106,11 @@ def fill_fees(broker: str, principal: Decimal, partner_rate: Decimal
     return brokerage, custody, reg, broker_cost, custody_cost, partner_share
 
 
+INV_OP = {"add": "del_lot", "del_lot": "add",
+          "consume_full": "ins_lot", "ins_lot": "consume_full",
+          "consume_part": "repl_lot", "repl_lot": "consume_part"}
+
+
 class Book:
     def __init__(self) -> None:
         # balances[(customer_id, account)] = debit-positive balance
@@ -170,13 +175,13 @@ class Book:
             if take == lot["qty"]:
                 cost = lot["cost"]
                 lots.pop(0)
-                self._ops.append({"op": "remove", "cid": cid, "symbol": symbol,
+                self._ops.append({"op": "consume_full", "cid": cid, "symbol": symbol,
                                   "id": lot["id"], "qty": take, "cost": cost})
             else:
                 cost = money(lot["cost"] * take / lot["qty"])
                 lot["qty"] -= take
                 lot["cost"] -= cost
-                self._ops.append({"op": "relieve", "cid": cid, "symbol": symbol,
+                self._ops.append({"op": "consume_part", "cid": cid, "symbol": symbol,
                                   "id": lot["id"], "qty": take, "cost": cost})
             total_cost += cost
             remaining -= take
@@ -185,6 +190,54 @@ class Book:
     def _position(self, cid: str, symbol: str) -> tuple[Decimal, Decimal]:
         lots = self.lots.get((cid, symbol), [])
         return sum(l["qty"] for l in lots), sum(l["cost"] for l in lots)
+
+    def _apply_lot_ops(self, ops: list[dict]) -> None:
+        """Apply recorded lot ops to this book, recording each applied op into
+        the current event's lot_ops so a reversal of this event (or of a
+        reversal) can invert them symmetrically.
+
+        op -- inverse -- meaning
+        add -- del_lot -- append a lot (id pre-allocated)
+        del_lot -- add -- remove the lot by id
+        consume_full -- ins_lot -- a lot was fully consumed (re-insert it)
+        ins_lot -- consume_full -- remove a re-inserted lot again
+        consume_part -- repl_lot -- part of a lot was consumed (restore it)
+        repl_lot -- consume_part -- re-deduct a restored portion
+        """
+        for op in ops:
+            key = (op["cid"], op["symbol"])
+            t = op["op"]
+            if t == "add":
+                self.lots[key].append({"id": op["id"], "qty": op["qty"],
+                                       "cost": op["cost"]})
+            elif t == "del_lot":
+                lst = self.lots.get(key, [])
+                for i, lot in enumerate(lst):
+                    if lot["id"] == op["id"]:
+                        lst.pop(i)
+                        break
+            elif t == "consume_full":
+                self.lots[key].insert(0, {"id": op["id"], "qty": op["qty"],
+                                          "cost": op["cost"]})
+            elif t == "ins_lot":
+                lst = self.lots.get(key, [])
+                for i, lot in enumerate(lst):
+                    if lot["id"] == op["id"]:
+                        lst.pop(i)
+                        break
+            elif t == "consume_part":
+                for lot in self.lots.get(key, []):
+                    if lot["id"] == op["id"]:
+                        lot["qty"] -= op["qty"]
+                        lot["cost"] -= op["cost"]
+                        break
+            elif t == "repl_lot":
+                for lot in self.lots.get(key, []):
+                    if lot["id"] == op["id"]:
+                        lot["qty"] += op["qty"]
+                        lot["cost"] += op["cost"]
+                        break
+            self._ops.append(op)
 
     def find_event(self, event_id: str) -> dict | None:
         """The raw event as first delivered, or None."""
@@ -633,10 +686,28 @@ class Book:
         return []
 
     def on_reversal(self, p, ev):
-        raise NotImplementedError(
-            "Post the exact inverse of the original's legs, and undo its effect "
-            "on your LOT BOOK too. A reversed buy whose lot you leave behind "
-            "balances perfectly and corrupts every later cost basis")
+        """Post the exact inverse of the original's legs and undo its effect on
+        the lot book too. A reversed buy whose lot you leave in place balances
+        perfectly and quietly corrupts every later cost basis. Both entries are
+        kept: the audit trail retains the original and its reversal.
+
+        Reversing a fill does not restore the hold: a released hold stays
+        released. A reversal of an event you never received is rejected.
+        """
+        src = p["reverses_event_id"]
+        entry = None
+        for e in self.event_log:
+            if e["event"]["event_id"] == src:
+                entry = e
+                break
+        if entry is None:
+            raise Rejected("reversal of unknown event")
+        inv_legs = [{"account": l["account"], "customer_id": l["customer_id"],
+                     "debit": l["credit"], "credit": l["debit"]}
+                    for l in entry["legs"]]
+        for op in reversed(entry["lot_ops"]):
+            self._apply_lot_ops([{**op, "op": INV_OP[op["op"]]}])
+        return inv_legs
 
     # -- reporting ----------------------------------------------------------
     def snapshot(self, as_of_event_id: str | None = None) -> dict:
