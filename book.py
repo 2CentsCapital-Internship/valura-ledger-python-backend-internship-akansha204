@@ -280,6 +280,13 @@ class Book:
                 # it must leave your book exactly as it was. A redelivered
                 # rejected event stays one rejection: it is already in `seen`.
                 entry["status"] = "rejected"
+            except Exception as exc:
+                # A payload that will not parse or a handler bug must never stop
+                # the run: reject the event and carry on. This is also how the
+                # feed's deliberate malformed events are handled.
+                print(f"  rejecting {ev['type']} {eid}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                entry["status"] = "rejected"
         else:
             self.todo[ev["type"]] += 1
             entry["status"] = "unimplemented"

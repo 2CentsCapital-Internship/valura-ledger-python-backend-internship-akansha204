@@ -103,7 +103,13 @@ class ArenaClient:
                 elif line.startswith("data:"):
                     data = line[5:].strip()
                 elif line == "" and data is not None:
-                    ev = json.loads(data)
+                    try:
+                        ev = json.loads(data)
+                    except (ValueError, TypeError):
+                        # A payload that will not parse: skip it and keep going.
+                        self.stats["errors"] += 1
+                        etype = data = None
+                        continue
 
                     if etype == "stream_open":
                         nxt = ev.get("next_event_in_seconds")
