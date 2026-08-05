@@ -76,6 +76,31 @@ def broker_fees(broker: str, principal: Decimal) -> tuple[Decimal, ...]:
     return brokerage, custody, reg, broker_cost, custody_cost
 
 
+def fill_fees(broker: str, principal: Decimal, partner_rate: Decimal
+              ) -> tuple[Decimal, ...]:
+    """All six derived amounts for one fill, each rounded to the cent
+    independently before use.
+
+    partner_rate x (revenue - cost), where revenue is what the customer was
+    charged (brokerage + custody) and cost is what broker + custodian charged
+    the firm (broker cost + custody cost). Where cost exceeds revenue the share
+    is zero; there is no clawback. partner_rate can be 0.50, so the product can
+    land exactly on a half cent and the rounding convention above decides it.
+
+    Returns (brokerage, custody, regulatory, broker_cost, custody_cost,
+    partner_share).
+    """
+    brokerage, custody, reg, broker_cost, custody_cost = \
+        broker_fees(broker, principal)
+    revenue = brokerage + custody
+    cost = broker_cost + custody_cost
+    if cost >= revenue:
+        partner_share = ZERO
+    else:
+        partner_share = money(partner_rate * (revenue - cost))
+    return brokerage, custody, reg, broker_cost, custody_cost, partner_share
+
+
 class Book:
     def __init__(self) -> None:
         # balances[(customer_id, account)] = debit-positive balance
