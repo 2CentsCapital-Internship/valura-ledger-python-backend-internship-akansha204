@@ -64,6 +64,8 @@ TARIFF: dict[str, dict] = {
 }
 REG_BPS = D("0.0008")
 
+BROKER_ACCOUNT = {"BRK-A": "2411", "BRK-B": "2412", "BRK-C": "2413"}
+
 
 def broker_fees(broker: str, principal: Decimal) -> tuple[Decimal, ...]:
     """Derive the fill fee chain for one broker and principal. Each amount is
@@ -509,7 +511,7 @@ class Book:
         principal = money(D(p["principal"]))
         broker = p["broker"]
         partner_rate = D(p["partner_rate"])
-        broker_payable = {"BRK-A": "2411", "BRK-B": "2412", "BRK-C": "2413"}[broker]
+        broker_payable = BROKER_ACCOUNT[broker]
 
         b, c, r, bc, cc, ps = fill_fees(broker, principal, partner_rate)
 
@@ -584,6 +586,32 @@ class Book:
                     leg("1100", cid, credit=principal)]
         return [leg("1100", cid, debit=principal),
                 leg("1150", cid, credit=principal)]
+
+    # -- paying it all onward ---------------------------------------------
+    # Four payables accrue a few cents per trade and are discharged in full,
+    # one customer at a time, paid out of omnibus cash. The amount is never in
+    # the payload: it is whatever has accumulated on that account for that
+    # customer, so each of these audits every per-trade rounding since the last
+    # one. Settling an account with nothing outstanding is an error.
+    def _settle_payable(self, cid: str, account: str) -> list[dict]:
+        outstanding = -self.balances.get((cid, account), ZERO)
+        if outstanding <= 0:
+            raise Rejected(f"nothing outstanding to settle on {account}")
+        return [leg(account, cid, debit=outstanding),
+                leg("1100", cid, credit=outstanding)]
+
+    def on_broker_fees_settled(self, p, ev):
+        return self._settle_payable(p["customer_id"],
+                                    BROKER_ACCOUNT[p["broker"]])
+
+    def on_custodian_fees_settled(self, p, ev):
+        return self._settle_payable(p["customer_id"], "2420")
+
+    def on_reg_fees_remitted(self, p, ev):
+        return self._settle_payable(p["customer_id"], "2400")
+
+    def on_partner_payout(self, p, ev):
+        return self._settle_payable(p["customer_id"], "2430")
 
     def on_order_cancelled(self, p, ev):
         """No legs. Release the remaining hold; the order is closed."""
