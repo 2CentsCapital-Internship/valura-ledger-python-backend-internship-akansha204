@@ -128,6 +128,7 @@ class Book:
         self.withdrawals: dict[str, dict] = {}     # withdrawal_id -> {amount, customer_id}
         self.fee_amounts: dict[str, dict] = {}     # fee_charged event_id -> amount
         self.refunded_fees: set[str] = set()       # fee_charged event_ids already refunded
+        self.trades: dict[str, dict] = {}          # trade_id -> {side, principal, customer_id}
 
         # Full history in delivery order. Each entry:
         #   {"event": ev, "legs": [...], "lot_ops": [...], "status": ...}
@@ -422,16 +423,109 @@ class Book:
         return self.on_order_filled(p, ev)
 
     def on_order_filled(self, p, ev):
-        raise NotImplementedError(
-            "buy:  Dr 2010 principal+commission, Dr 1200 principal / "
-            "Cr 2350 principal, Cr 2100 principal, Cr 4000 commission. "
-            "sell: Dr 1150 principal, Dr 2100 FIFO cost / Cr 2010 "
-            "principal-commission-reg, Cr 1200 cost, Cr 4000 commission, "
-            "Cr 2400 reg. Cash does NOT move on the trade date")
+        """A fill posts the full buy/sell economics. Cash does NOT move on the
+        trade date; a trade_settled event discharges the obligation later.
+
+        Buy (P principal, b/c/r customer charges, bc/cc/ps firm costs):
+            Dr 2010 P+b+c+r        Cr 2350 P
+            Dr 1200 P              Cr 2100 P
+            Dr 5000 bc             Cr 4000 b
+            Dr 5010 cc             Cr 4010 c
+            Dr 5100 ps             Cr 2400 r
+                                   Cr 241x bc
+                                   Cr 2420 cc
+                                   Cr 2430 ps
+        Sell: same firm economics, with Dr 1150 P / Cr 2010 P-b-c-r, and
+            Dr 2100 cost / Cr 1200 cost where cost is the FIFO cost of the
+            shares sold (never the realised P&L directly).
+
+        The fee amounts are not in the payload: the tariff turns the broker and
+        the principal into money. A fill releases a proportional share of the
+        hold that order placed; order_filled is the last fill and closes it.
+        """
+        oid = p["order_id"]
+        cid = p["customer_id"]
+        side = p["side"]
+        symbol = p["symbol"]
+        q = D(p["quantity"])
+        principal = money(D(p["principal"]))
+        broker = p["broker"]
+        partner_rate = D(p["partner_rate"])
+        broker_payable = {"BRK-A": "2411", "BRK-B": "2412", "BRK-C": "2413"}[broker]
+
+        b, c, r, bc, cc, ps = fill_fees(broker, principal, partner_rate)
+
+        # Consume/receive lots BEFORE touching any other state, so an oversell
+        # raises Rejected leaving the book exactly as it was.
+        if side == "sell":
+            cost = self._consume_lots(cid, symbol, q)
+        else:
+            cost = ZERO
+
+        order = self.orders.get(oid) or {}
+        order.setdefault("customer_id", cid)
+        order.setdefault("side", side)
+        order.setdefault("symbol", symbol)
+        order.setdefault("asset_class", p.get("asset_class"))
+        order["filled_qty"] = order.get("filled_qty", ZERO) + q
+        self.orders[oid] = order
+
+        self.trades[p["trade_id"]] = {"side": side, "principal": principal,
+                                      "customer_id": cid}
+        self._release_hold(oid, q)
+        if ev["type"] == "order_filled":
+            self._close_order(oid)
+
+        if side == "buy":
+            self._add_lot(cid, symbol, q, principal)
+            return [
+                leg("2010", cid, debit=principal + b + c + r),
+                leg("1200", cid, debit=principal),
+                leg("5000", cid, debit=bc),
+                leg("5010", cid, debit=cc),
+                leg("5100", cid, debit=ps),
+                leg("2350", cid, credit=principal),
+                leg("2100", cid, credit=principal),
+                leg("4000", cid, credit=b),
+                leg("4010", cid, credit=c),
+                leg("2400", cid, credit=r),
+                leg(broker_payable, cid, credit=bc),
+                leg("2420", cid, credit=cc),
+                leg("2430", cid, credit=ps),
+            ]
+        return [
+            leg("1150", cid, debit=principal),
+            leg("2100", cid, debit=cost),
+            leg("5000", cid, debit=bc),
+            leg("5010", cid, debit=cc),
+            leg("5100", cid, debit=ps),
+            leg("2010", cid, credit=principal - b - c - r),
+            leg("1200", cid, credit=cost),
+            leg("4000", cid, credit=b),
+            leg("4010", cid, credit=c),
+            leg("2400", cid, credit=r),
+            leg(broker_payable, cid, credit=bc),
+            leg("2420", cid, credit=cc),
+            leg("2430", cid, credit=ps),
+        ]
 
     def on_trade_settled(self, p, ev):
-        raise NotImplementedError(
-            "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
+        """Settlement day: the cash from that fill actually moves, discharging
+        the obligation the fill created. Nothing else about the trade changes.
+
+            buy    Dr 2350 principal     Cr 1100 principal
+            sell   Dr 1100 principal     Cr 1150 principal
+        """
+        t = self.trades.get(p["trade_id"])
+        if t is None:
+            raise Rejected("settle of unknown trade")
+        cid = t["customer_id"]
+        principal = t["principal"]
+        if t["side"] == "buy":
+            return [leg("2350", cid, debit=principal),
+                    leg("1100", cid, credit=principal)]
+        return [leg("1100", cid, debit=principal),
+                leg("1150", cid, credit=principal)]
 
     def on_order_cancelled(self, p, ev):
         """No legs. Release the remaining hold; the order is closed."""
