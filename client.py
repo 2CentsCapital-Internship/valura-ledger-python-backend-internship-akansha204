@@ -96,6 +96,10 @@ class ArenaClient:
                 {"event_id": ev["event_id"], "type": ev["type"],
                  "payload": ev["payload"], "legs": legs}) + "\n")
             self.events_log.flush()
+        if legs is None:
+            # Already posted once; a second submission is recorded as a
+            # duplicate and counts against you. Submit nothing.
+            return
         # An event you correctly reject still needs a submission, with no legs.
         self.pending.append({"event_id": ev["event_id"], "legs": legs or []})
         self.stats["events"] += 1

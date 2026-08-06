@@ -141,6 +141,7 @@ class Book:
         self.fee_amounts: dict[str, dict] = {}     # fee_charged event_id -> amount
         self.refunded_fees: set[str] = set()       # fee_charged event_ids already refunded
         self.trades: dict[str, dict] = {}          # trade_id -> {side, principal, customer_id}
+        self.filled_trades: set[str] = set()       # trade_ids already posted
 
         # Full history in delivery order. Each entry:
         #   {"event": ev, "legs": [...], "lot_ops": [...], "status": ...}
@@ -258,7 +259,7 @@ class Book:
         """
         eid = ev["event_id"]
         if eid in self.seen:
-            return []                      # already seen; nothing new happens
+            return None                    # already seen; nothing new happens
         self.seen.add(eid)
 
         entry = {"event": ev, "legs": [], "lot_ops": [], "status": "noop"}
@@ -267,6 +268,12 @@ class Book:
         if handler is not None:
             try:
                 legs = handler(ev["payload"], ev) or []
+                # A leg whose debit and credit are both zero carries no
+                # information: the reference omits it, and emitting it counts
+                # against you as an unexpected leg.
+                legs = [l for l in legs
+                        if money(D(l["debit"])) != ZERO
+                        or money(D(l["credit"])) != ZERO]
                 if legs:
                     self._post(legs)
                     entry["legs"] = legs
@@ -519,6 +526,13 @@ class Book:
         broker = p["broker"]
         partner_rate = D(p["partner_rate"])
         broker_payable = BROKER_ACCOUNT[broker]
+
+        # The stream can re-send a fill for a trade it already posted, with a
+        # brand-new event_id. Only the first fill of a trade posts anything.
+        tid = p["trade_id"]
+        if tid in self.filled_trades:
+            return []
+        self.filled_trades.add(tid)
 
         b, c, r, bc, cc, ps = fill_fees(broker, principal, partner_rate)
 
