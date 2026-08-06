@@ -188,12 +188,14 @@ def main() -> int:
                     help="write practice response feedback (diffs) to PATH")
     ap.add_argument("--log-events", default=None,
                     help="write each consumed event (id, type, payload) to PATH")
+    ap.add_argument("--yes", action="store_true",
+                    help="skip the confirmation prompt for non-practice modes")
     a = ap.parse_args()
 
     if a.mode != "practice":
         print(f"\n  You are about to start a {a.mode.upper()} run.")
         print("  Attempts are limited and this one will count.")
-        if input("  Type the mode name to continue: ").strip() != a.mode:
+        if not a.yes and input("  Type the mode name to continue: ").strip() != a.mode:
             print("  Cancelled.")
             return 1
 
