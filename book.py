@@ -142,6 +142,7 @@ class Book:
         self.refunded_fees: set[str] = set()       # fee_charged event_ids already refunded
         self.trades: dict[str, dict] = {}          # trade_id -> {side, principal, customer_id}
         self.filled_trades: set[str] = set()       # trade_ids already posted
+        self.reversed_trades: set[str] = set()     # fills that were reversed
 
         # Full history in delivery order. Each entry:
         #   {"event": ev, "legs": [...], "lot_ops": [...], "status": ...}
@@ -600,6 +601,8 @@ class Book:
         t = self.trades.get(p["trade_id"])
         if t is None:
             raise Rejected("settle of unknown trade")
+        if p["trade_id"] in self.reversed_trades:
+            raise Rejected("settle of a reversed trade")
         cid = t["customer_id"]
         principal = t["principal"]
         if t["side"] == "buy":
@@ -754,6 +757,9 @@ class Book:
         inv_legs = [{"account": l["account"], "customer_id": l["customer_id"],
                      "debit": l["credit"], "credit": l["debit"]}
                     for l in entry["legs"]]
+        if entry["event"]["type"] in ("order_filled", "order_partially_filled"):
+            self.reversed_trades.add(
+                entry["event"]["payload"].get("trade_id", ""))
         for op in reversed(entry["lot_ops"]):
             self._apply_lot_ops([{**op, "op": INV_OP[op["op"]]}])
         return inv_legs
