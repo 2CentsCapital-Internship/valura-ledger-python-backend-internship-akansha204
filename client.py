@@ -40,6 +40,7 @@ class ArenaClient:
                       "reconnects": 0, "resets": 0, "errors": 0}
         self.feedback = []
         self.feedback_path = None
+        self.events_log = None
         self.done = False
 
     # -- submitting ---------------------------------------------------------
@@ -90,6 +91,11 @@ class ArenaClient:
     # -- consuming ----------------------------------------------------------
     def handle(self, ev: dict) -> None:
         legs = self.book.apply(ev)
+        if self.events_log is not None:
+            self.events_log.write(json.dumps(
+                {"event_id": ev["event_id"], "type": ev["type"],
+                 "payload": ev["payload"], "legs": legs}) + "\n")
+            self.events_log.flush()
         # An event you correctly reject still needs a submission, with no legs.
         self.pending.append({"event_id": ev["event_id"], "legs": legs or []})
         self.stats["events"] += 1
@@ -176,6 +182,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=1500)
     ap.add_argument("--feedback", default=None,
                     help="write practice response feedback (diffs) to PATH")
+    ap.add_argument("--log-events", default=None,
+                    help="write each consumed event (id, type, payload) to PATH")
     a = ap.parse_args()
 
     if a.mode != "practice":
@@ -187,8 +195,12 @@ def main() -> int:
 
     c = ArenaClient(a.url, a.key, a.mode)
     c.feedback_path = a.feedback
+    evf = open(a.log_events, "w") if a.log_events else None
+    c.events_log = evf
     print(f"connecting to {a.url} as {a.mode} ...", flush=True)
     out = c.run(a.seconds)
+    if evf is not None:
+        evf.close()
     if c.feedback and a.feedback:
         with open(a.feedback, "w") as f:
             for fb in c.feedback:
